@@ -1,0 +1,735 @@
+#!/usr/bin/env python3
+"""shelve: an LRU shelf for herdr agent tabs.
+
+Keep the `keep` most recently focused agent tabs awake. Shelve the rest: quit
+each agent (the pane and tab stay), remember its session, and resume it in the
+same pane when the tab is focused again. Works for any agent kind that herdr
+reports a session id for and that has a profile below (or in config.toml).
+
+Invariant: the only durable handle to a shelved agent is its record
+(kind, session, cwd, argv). A record is written before the agent is asked to
+exit and is deleted only once the pane is seen running that same session again.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import glob
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
+os.umask(0o077)  # state holds session ids and launch flags: keep it private
+SESSION = os.environ.get("HERDR_SESSION") or "default"
+STATE_DIR = Path(
+    os.environ.get("HERDR_PLUGIN_STATE_DIR")
+    or Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "herdr/plugins/meta-boy.shelve"
+) / SESSION
+CONFIG_DIR = Path(
+    os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "herdr/plugins/config/meta-boy.shelve"
+)
+STATE = STATE_DIR / "state.json"
+QUEUE = STATE_DIR / "queue"
+LOCK = STATE_DIR / "lock"
+LOG = STATE_DIR / "shelve.log"
+
+# How to stop and resume each agent kind. `exit = "signal"` sends SIGTERM to
+# the agent process (clean exit, unsent draft discarded). `exit = "keys"` sends
+# `exit_keys` to the pane, for agents that leave the terminal dirty on a signal.
+# `replay` lists the launch flags (with their arity) carried over on resume;
+# anything else in the original argv is dropped and logged.
+PROFILES: dict[str, dict] = {
+    "claude": {
+        "exit": "signal",
+        "process_names": ["claude"],
+        "resume": ["--resume", "{session}"],
+        "transcript": "~/.claude/projects/*/{session}.jsonl",
+        "replay": {
+            "--permission-mode": 1, "--add-dir": 1, "--model": 1, "--effort": 1,
+            "--dangerously-skip-permissions": 0, "--allow-dangerously-skip-permissions": 0,
+            "--mcp-config": 1, "--strict-mcp-config": 0, "--settings": 1,
+            "--append-system-prompt": 1, "--allowedTools": 1, "--disallowedTools": 1,
+            "--agent": 1, "--plugin-dir": 1, "--ide": 0, "--chrome": 0,
+        },
+    },
+    "opencode": {
+        "exit": "signal",
+        "process_names": ["opencode", ".opencode"],
+        "resume": ["--session", "{session}"],
+        "transcript": None,
+        "replay": {"--model": 1, "-m": 1, "--agent": 1},
+    },
+    "codex": {
+        # codex leaves the kitty keyboard protocol on after a signal, so quit
+        # through its UI: the first ctrl+c clears any draft, the next two quit.
+        "exit": "keys",
+        "exit_keys": [["ctrl+c"], ["ctrl+c"], ["ctrl+c"]],
+        "process_names": ["codex"],
+        "resume": ["resume", "{session}"],
+        "transcript": "~/.codex/sessions/**/*{session}.jsonl",
+        "replay": {"--model": 1, "-m": 1, "--profile": 1, "-p": 1, "--sandbox": 1, "-s": 1,
+                   "--ask-for-approval": 1, "-a": 1, "--full-auto": 0,
+                   "--dangerously-bypass-approvals-and-sandbox": 0, "--search": 0},
+    },
+}
+
+DEFAULTS = {
+    "keep": 8,
+    "dry_run": False,
+    "pin_marker": "📌",
+    "skip_markers": ["👁"],
+    "shelf_marker": "💤",
+    "exit_timeout": 40,
+    "wake_timeout": 60,
+    "notify": True,
+}
+
+
+# ------------------------------------------------------------------ plumbing
+
+def log(msg: str) -> None:
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}"
+    try:
+        STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with LOG.open("a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    print(msg, file=sys.stderr)
+
+
+def load_config() -> dict:
+    cfg = dict(DEFAULTS)
+    cfg["kinds"] = {k: dict(v) for k, v in PROFILES.items()}
+    path = CONFIG_DIR / "config.toml"
+    if path.exists():
+        try:
+            import tomllib
+        except ImportError:  # python < 3.11: run on defaults rather than misparse
+            log(f"config: python {sys.version.split()[0]} has no tomllib; ignoring {path}")
+            return cfg
+        with path.open("rb") as fh:
+            user = tomllib.load(fh)
+        for key, val in user.items():
+            if key == "kinds":
+                for kind, prof in val.items():
+                    cfg["kinds"].setdefault(kind, {}).update(prof)
+            else:
+                cfg[key] = val
+    return cfg
+
+
+class HerdrError(RuntimeError):
+    pass
+
+
+def herdr(*args: str, timeout: float = 30) -> dict:
+    proc = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise HerdrError(f"herdr {' '.join(args)}: {proc.stderr.strip() or proc.stdout.strip()}")
+    out = proc.stdout.strip()
+    return json.loads(out).get("result", {}) if out.startswith("{") else {}
+
+
+def load_state() -> dict:
+    try:
+        state = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        state = {}
+    state.setdefault("mru", [])
+    state.setdefault("shelf", {})     # pane_id -> record
+    state.setdefault("orphans", [])   # records whose pane we can no longer prove is theirs
+    return state
+
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=1, ensure_ascii=False))
+    os.replace(tmp, STATE)
+
+
+def enqueue(line: str) -> None:
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with QUEUE.open("a") as fh:
+        fh.write(line + "\n")
+
+
+def drain_queue() -> list[str]:
+    work = QUEUE.with_suffix(".work")
+    try:
+        os.replace(QUEUE, work)
+    except FileNotFoundError:
+        return []
+    lines = work.read_text().splitlines()
+    work.unlink(missing_ok=True)
+    return [l for l in lines if l.strip()]
+
+
+def spawn_worker() -> None:
+    """Run the worker detached so hooks return at once and hold no plugin slot."""
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "work"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True, close_fds=True,
+    )
+
+
+def find_key(obj, key: str):
+    if isinstance(obj, dict):
+        if key in obj and isinstance(obj[key], str):
+            return obj[key]
+        for v in obj.values():
+            found = find_key(v, key)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = find_key(v, key)
+            if found:
+                return found
+    return None
+
+
+def context_tab() -> str | None:
+    try:
+        ctx = json.loads(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON") or "{}")
+    except ValueError:
+        ctx = {}
+    return find_key(ctx, "tab_id") or os.environ.get("HERDR_TAB_ID")
+
+
+# ------------------------------------------------------------- live snapshot
+
+class Snapshot:
+    def __init__(self) -> None:
+        self.tabs = {t["tab_id"]: t for t in herdr("tab", "list").get("tabs", [])}
+        self.panes = {p["pane_id"]: p for p in herdr("pane", "list").get("panes", [])}
+        self.agents = {a["pane_id"]: a for a in herdr("agent", "list").get("agents", [])}
+
+    def tab_panes(self, tab_id: str) -> list[dict]:
+        return [p for p in self.panes.values() if p.get("tab_id") == tab_id]
+
+    def focused_tab(self) -> str | None:
+        return next((t for t, v in self.tabs.items() if v.get("focused")), None)
+
+
+def process_info(pane_id: str) -> dict | None:
+    try:
+        return herdr("pane", "process-info", "--pane", pane_id).get("process_info")
+    except (HerdrError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def shell_only(info: dict | None) -> bool | None:
+    """True: only the shell is in the foreground. None: herdr could not tell."""
+    if not info or not info.get("foreground_processes"):
+        return None
+    shell = info.get("shell_pid")
+    return all(p.get("pid") == shell for p in info["foreground_processes"])
+
+
+def agent_process(info: dict | None, names: list[str]) -> dict | None:
+    for proc in (info or {}).get("foreground_processes", []):
+        argv = proc.get("argv") or []
+        heads = [proc.get("name") or ""] + [os.path.basename(a) for a in argv[:2]]
+        if any(h in names for h in heads):
+            return proc
+    return None
+
+
+def session_live_elsewhere(session: str) -> bool:
+    me = {os.getpid(), os.getppid()}
+    out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if session in args and pid.isdigit() and int(pid) not in me:
+            return True
+    return False
+
+
+def has_transcript(prof: dict, session: str) -> bool:
+    pattern = prof.get("transcript")
+    if not pattern:
+        return True  # no on-disk check known for this kind; trust herdr's session ref
+    return bool(glob.glob(os.path.expanduser(pattern.format(session=session)), recursive=True))
+
+
+def replay_args(prof: dict, argv: list[str], names: list[str], session: str) -> list[str]:
+    """Launch flags safe to carry over to the resumed agent."""
+    allowed: dict = prof.get("replay") or {}
+    resume_tokens = {x.format(session=session) for x in prof.get("resume", [])}
+    start = 1
+    for i, a in enumerate(argv[:3]):  # skip `node …/cli.js` style wrappers
+        if os.path.basename(a) in names or a.endswith("cli.js"):
+            start = i + 1
+    out, dropped, i = [], [], start
+    while i < len(argv):
+        a = argv[i]
+        flag, eq, _ = a.partition("=")
+        if flag in allowed:
+            arity = 0 if eq else int(allowed[flag])
+            out.extend(argv[i:i + 1 + arity])
+            i += 1 + arity
+        else:
+            if a not in resume_tokens:  # the resume flags are added back on wake
+                dropped.append(a)
+            i += 1
+    if dropped:  # flag names only: values and positional prompts may be private
+        flags = sorted({d.partition("=")[0] for d in dropped if d.startswith("-")})
+        values = sum(1 for d in dropped if not d.startswith("-"))
+        log(f"replay: dropped flags {' '.join(flags) or '(none)'} and {values} other args")
+    return out
+
+
+def strip_marker(label: str, marker: str) -> str:
+    return label[len(marker):].lstrip() if label.startswith(marker) else label
+
+
+# ----------------------------------------------------------- tab eligibility
+
+def tab_verdict(snap: Snapshot, tab_id: str, cfg: dict) -> tuple[str, list]:
+    """Classify a tab for the LRU. Returns (status, candidates), status one of:
+      none     - no agent panes, ignored by the LRU
+      pinned   - never shelved, outside the cap
+      ready    - awake and safe to shelve; candidates = [(pane, agent, prof, info, proc)]
+      busy:<why> - awake but not safe to shelve right now
+    """
+    tab = snap.tabs.get(tab_id) or {}
+    label = tab.get("label") or ""
+    panes = snap.tab_panes(tab_id)
+    agents = [snap.agents[p["pane_id"]] for p in panes if p["pane_id"] in snap.agents]
+    if label.startswith(cfg["pin_marker"]):
+        return "pinned", []
+    if not agents:
+        return "none", []
+    if any(label.startswith(m) for m in cfg["skip_markers"]):
+        return "pinned", []
+    cands = []
+    for p in panes:
+        pid = p["pane_id"]
+        a = snap.agents.get(pid)
+        info = process_info(pid)
+        if a is None:
+            only = shell_only(info)
+            if only is not True:
+                fg = ",".join(x.get("name", "?") for x in (info or {}).get("foreground_processes", []))
+                return f"busy:{pid} runs {fg or 'unknown'}", []
+            continue
+        kind = a.get("agent")
+        if not kind:
+            return f"busy:{pid} agent is starting or exiting", []
+        prof = cfg["kinds"].get(kind)
+        if not prof:
+            return f"busy:{pid} {kind} has no profile", []
+        if a.get("agent_status") not in ("idle", "done"):
+            return f"busy:{pid} {a.get('agent_status')}", []
+        session = (a.get("agent_session") or {}).get("value")
+        if not session:
+            return f"busy:{pid} no session id", []
+        if not has_transcript(prof, session):
+            return f"busy:{pid} session has no transcript yet", []
+        proc = agent_process(info, prof.get("process_names", [kind]))
+        if prof.get("exit") == "signal" and not proc:
+            return f"busy:{pid} agent process not found", []
+        cands.append((p, a, prof, info, proc))
+    return "ready", cands
+
+
+# --------------------------------------------------------------- shelve/wake
+
+def shelve_tab(snap: Snapshot, tab_id: str, cands: list, cfg: dict, state: dict) -> bool:
+    tab_label = (snap.tabs.get(tab_id) or {}).get("label") or ""
+    if cfg["dry_run"]:
+        log(f"dry-run: would shelve {tab_id} '{tab_label}' ({len(cands)} agents)")
+        return False
+    marker = cfg["shelf_marker"]
+    ok_all = True
+    for p, a, prof, info, proc in cands:
+        pid = p["pane_id"]
+        session = a["agent_session"]["value"]
+        names = prof.get("process_names", [a["agent"]])
+        rec = {
+            "phase": "exiting", "kind": a["agent"], "session": session,
+            "cwd": (proc or {}).get("cwd") or a.get("foreground_cwd") or a.get("cwd"),
+            "args": replay_args(prof, (proc or {}).get("argv") or [], names, session),
+            "name": a.get("name"), "tab_id": tab_id, "tab_label": tab_label,
+            "terminal_id": p.get("terminal_id"), "title": a.get("terminal_title_stripped"),
+            "status": a.get("agent_status"), "at": int(time.time()),
+        }
+        state["shelf"][pid] = rec
+        save_state(state)  # the record exists before the agent is touched
+        try:
+            if prof.get("exit") == "signal":
+                os.kill(int(proc["pid"]), 15)
+            else:
+                for keys in prof.get("exit_keys", []):
+                    herdr("pane", "send-keys", pid, *keys)
+                    time.sleep(0.6)
+        except (OSError, HerdrError) as e:
+            log(f"shelve {pid}: exit failed: {e}")
+            del state["shelf"][pid]
+            save_state(state)
+            ok_all = False
+            continue
+        if wait_exited(pid, cfg["exit_timeout"]):
+            rec["phase"] = "shelved"
+            try:
+                herdr("pane", "rename", pid, f"{marker} {rec['title'] or rec['kind']}")
+            except HerdrError:
+                pass
+            log(f"shelved {pid} {rec['kind']} {session} ({tab_label})")
+        else:
+            log(f"shelve {pid}: agent still there after {cfg['exit_timeout']}s; next pass reconciles")
+            ok_all = False
+        save_state(state)
+    if any(state["shelf"].get(p["pane_id"], {}).get("phase") == "shelved" for p, *_ in cands):
+        try:
+            herdr("tab", "rename", tab_id, f"{marker} {strip_marker(tab_label, marker)}")
+        except HerdrError:
+            pass
+    return ok_all
+
+
+def wait_exited(pane_id: str, timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(1)
+        try:
+            pane = herdr("pane", "get", pane_id).get("pane", {})
+        except HerdrError:
+            return False
+        if not pane.get("agent") and shell_only(process_info(pane_id)) is True:
+            return True
+    return False
+
+
+def wake_tab(snap: Snapshot, tab_id: str, cfg: dict, state: dict) -> None:
+    pids = [pid for pid, r in state["shelf"].items() if r.get("tab_id") == tab_id]
+    if not pids:
+        return
+    marker = cfg["shelf_marker"]
+    for pid in pids:
+        wake_pane(snap, pid, cfg, state)
+    if not any(r.get("tab_id") == tab_id for r in state["shelf"].values()):
+        label = (snap.tabs.get(tab_id) or {}).get("label") or ""
+        if label.startswith(marker):
+            try:
+                herdr("tab", "rename", tab_id, strip_marker(label, marker) or "agent")
+            except HerdrError:
+                pass
+
+
+def wake_pane(snap: Snapshot, pid: str, cfg: dict, state: dict) -> None:
+    rec = state["shelf"][pid]
+    pane = snap.panes.get(pid)
+    if pane is None or pane.get("tab_id") != rec.get("tab_id"):
+        orphan(state, pid, "pane gone or moved")
+        return
+    a = snap.agents.get(pid)
+    if a and (a.get("agent_session") or {}).get("value") == rec["session"]:
+        finish_wake(pid, rec, state, "already running")  # herdr restore or a manual resume
+        return
+    if a:
+        orphan(state, pid, f"pane now runs {a.get('agent')}")
+        return
+    if rec["phase"] == "exiting":
+        log(f"wake {pid}: still exiting; retry on next focus")
+        return
+    if pane.get("terminal_id") != rec.get("terminal_id"):
+        # herdr restarted: pane ids can be reused, so only trust a pane whose
+        # restored tab label still carries our marker.
+        label = (snap.tabs.get(rec["tab_id"]) or {}).get("label") or ""
+        if not label.startswith(cfg["shelf_marker"]):
+            orphan(state, pid, "terminal changed and tab lost the shelf marker")
+            return
+    if shell_only(process_info(pid)) is not True:
+        log(f"wake {pid}: pane is not at a bare shell; leaving it shelved")
+        return
+    if session_live_elsewhere(rec["session"]):
+        orphan(state, pid, "session is already open in another process")
+        return
+    prof = cfg["kinds"].get(rec["kind"]) or {}
+    cwd = rec.get("cwd")
+    if cwd and pane.get("foreground_cwd") != cwd and os.path.isdir(cwd):
+        herdr("pane", "run", pid, f"cd {shlex.quote(cwd)}")
+        time.sleep(0.5)
+    resume = [x.format(session=rec["session"]) for x in prof.get("resume", [])]
+    rec["phase"] = "waking"
+    save_state(state)
+    for name in name_candidates(rec):
+        try:
+            herdr("agent", "start", name, "--kind", rec["kind"], "--pane", pid,
+                  "--timeout", str(int(cfg["wake_timeout"] * 1000)), "--", *rec["args"], *resume,
+                  timeout=cfg["wake_timeout"] + 10)
+            break
+        except HerdrError as e:
+            if "agent_name_taken" in str(e):
+                continue
+            if "agent_not_ready" in str(e):
+                break  # started but blocked on a dialog; the user is looking at it
+            log(f"wake {pid}: agent start failed: {e}")
+            rec["phase"] = "shelved"
+            save_state(state)
+            return
+        except subprocess.TimeoutExpired:
+            break
+    # The session id is reported a moment after the agent appears.
+    deadline = time.time() + cfg["wake_timeout"]
+    while time.time() < deadline:
+        try:
+            got = herdr("pane", "get", pid).get("pane", {})
+        except HerdrError:
+            break
+        if (got.get("agent_session") or {}).get("value") == rec["session"]:
+            finish_wake(pid, rec, state, "resumed")
+            return
+        time.sleep(1)
+    log(f"wake {pid}: started, session not confirmed yet; record kept as waking")
+    save_state(state)
+
+
+def name_candidates(rec: dict) -> list[str]:
+    base = rec.get("name") or f"{rec['kind']}-{rec['session'][:6]}"
+    base = "".join(c if c.isalnum() or c in "-_" else "-" for c in base.lower())
+    if not base[:1].isalpha():
+        base = "a" + base
+    base = base[:28]
+    return [base, f"{base}-2", f"{base}-3", f"{rec['kind']}-{rec['session'][:8]}"]
+
+
+def finish_wake(pid: str, rec: dict, state: dict, how: str) -> None:
+    try:
+        herdr("pane", "rename", pid, "--clear")
+    except HerdrError:
+        pass
+    state["shelf"].pop(pid, None)
+    save_state(state)
+    log(f"unshelved {pid} {rec['kind']} {rec['session']} ({how})")
+
+
+def orphan(state: dict, pid: str, why: str) -> None:
+    rec = state["shelf"].pop(pid)
+    rec["orphaned"] = why
+    rec["manual"] = manual_command(rec)
+    state["orphans"].append(rec)
+    save_state(state)
+    log(f"orphaned {pid} ({why}); resume by hand: {rec['manual']}")
+
+
+def manual_command(rec: dict) -> str:
+    prof = PROFILES.get(rec["kind"], {})
+    resume = [x.format(session=rec["session"]) for x in prof.get("resume", ["{session}"])]
+    return f"cd {shlex.quote(rec.get('cwd') or '.')} && " + shlex.join([rec["kind"], *rec.get("args", []), *resume])
+
+
+# ------------------------------------------------------------------- the LRU
+
+def reconcile(snap: Snapshot, cfg: dict, state: dict) -> None:
+    for pid, rec in list(state["shelf"].items()):
+        pane = snap.panes.get(pid)
+        a = snap.agents.get(pid)
+        if rec["phase"] == "exiting" and pane and not a and shell_only(process_info(pid)) is True:
+            rec["phase"] = "shelved"
+            log(f"reconciled {pid}: exit finished")
+        elif rec["phase"] == "exiting" and a and (a.get("agent_session") or {}).get("value") == rec["session"]:
+            rec["sightings"] = rec.get("sightings", 0) + 1
+            if rec["sightings"] >= 2:
+                finish_wake(pid, rec, state, "exit never happened")
+        elif rec["phase"] == "waking" and a and (a.get("agent_session") or {}).get("value") == rec["session"]:
+            finish_wake(pid, rec, state, "confirmed late")
+        elif rec["phase"] == "waking" and not a and shell_only(process_info(pid)) is True:
+            rec["phase"] = "shelved"
+            log(f"reconciled {pid}: wake did not stick, back on the shelf")
+    save_state(state)
+
+
+def recency_order(snap: Snapshot, state: dict) -> list[str]:
+    """Live tabs, most recently used first.
+
+    Tabs focused since install come first, in focus order. The rest follow,
+    most recently active first: an agent's state_change_seq rises on every
+    state change, so it stands in for recency until the tab is focused.
+    """
+    known = [t for t in state["mru"] if t in snap.tabs]
+
+    def activity(t: str) -> int:
+        return max((snap.agents[p["pane_id"]].get("state_change_seq", 0)
+                    for p in snap.tab_panes(t) if p["pane_id"] in snap.agents), default=-1)
+    return known + sorted((t for t in snap.tabs if t not in known), key=activity, reverse=True)
+
+
+def rebalance(snap: Snapshot, cfg: dict, state: dict) -> None:
+    focused = snap.focused_tab()
+    state["mru"] = [t for t in state["mru"] if t in snap.tabs]
+    order = recency_order(snap, state)
+    shelved_tabs = {r.get("tab_id") for r in state["shelf"].values()}
+    awake = []
+    for t in order:
+        if t in shelved_tabs:  # a tab is shelved and woken as a unit
+            continue
+        status, cands = tab_verdict(snap, t, cfg)
+        if status in ("none", "pinned"):
+            continue
+        awake.append((t, status, cands))
+    excess = len(awake) - int(cfg["keep"])
+    for t, status, cands in reversed(awake):
+        if excess <= 0:
+            break
+        if t == focused:
+            continue
+        if status != "ready":
+            log(f"skip {t}: {status.removeprefix('busy:')}")
+            continue
+        if shelve_tab(snap, t, cands, cfg, state) or cfg["dry_run"]:
+            excess -= 1
+
+
+def work() -> None:
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    while True:
+        with LOCK.open("w") as lockfh:
+            try:
+                fcntl.flock(lockfh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return  # the holder drains the queue before it lets go
+            while True:
+                items = drain_queue()
+                if not items:
+                    break
+                cfg = load_config()
+                state = load_state()
+                focus = [l.split(None, 1)[1] for l in items if l.startswith("focus ")]
+                for t in focus:
+                    state["mru"] = [t] + [x for x in state["mru"] if x != t]
+                for l in items:
+                    if l.startswith("closed "):
+                        t = l.split(None, 1)[1]
+                        state["mru"] = [x for x in state["mru"] if x != t]
+                save_state(state)
+                try:
+                    snap = Snapshot()
+                    reconcile(snap, cfg, state)
+                    if focus and not cfg["dry_run"]:
+                        wake_tab(snap, focus[-1], cfg, state)
+                    for l in items:
+                        if l.startswith("shelve "):
+                            t = l.split(None, 1)[1]
+                            status, cands = tab_verdict(snap, t, cfg)
+                            if status == "ready":
+                                shelve_tab(snap, t, cands, cfg, state)
+                            else:
+                                log(f"shelve {t}: refused, {status}")
+                        elif l == "unshelve-all":
+                            for t in {r.get("tab_id") for r in list(state["shelf"].values())}:
+                                wake_tab(snap, t, cfg, state)
+                    if any(l.startswith(("focus ", "kick", "status ")) for l in items):
+                        rebalance(Snapshot(), cfg, state)
+                except Exception as e:  # one bad pass must not wedge the worker
+                    log(f"pass failed: {type(e).__name__}: {e}")
+        # Something may have been queued between the last drain and unlock.
+        if not QUEUE.exists():
+            return
+
+
+# ----------------------------------------------------------------- commands
+
+def cmd_hook(event: str) -> None:
+    payload = {}
+    try:
+        payload = json.loads(os.environ.get("HERDR_PLUGIN_EVENT_JSON") or "{}")
+    except ValueError:
+        pass
+    if event == "tab.focused":
+        tab = find_key(payload, "tab_id") or context_tab()
+        if tab:
+            enqueue(f"focus {tab}")
+    elif event == "tab.closed":
+        tab = find_key(payload, "tab_id")
+        if tab:
+            enqueue(f"closed {tab}")
+    elif event == "pane.agent_status_changed":
+        status = find_key(payload, "agent_status")
+        if status not in ("idle", "done"):
+            return  # only a settling agent can make a tab shelvable
+        enqueue("status settled")
+    else:  # startup, kick
+        enqueue("kick")
+    spawn_worker()
+
+
+def cmd_pin() -> None:
+    tab = context_tab()
+    if not tab:
+        sys.exit("no tab in context")
+    cfg = load_config()
+    label = herdr("tab", "get", tab).get("tab", {}).get("label") or ""
+    m = cfg["pin_marker"]
+    new = strip_marker(label, m) if label.startswith(m) else f"{m} {label}"
+    herdr("tab", "rename", tab, new or "pinned")
+    enqueue("kick")
+    spawn_worker()
+
+
+def cmd_status(wait: bool) -> None:
+    cfg = load_config()
+    state = load_state()
+    snap = Snapshot()
+    shelved_tabs = {r.get("tab_id") for r in state["shelf"].values()}
+    order = recency_order(snap, state)
+    focused = snap.focused_tab()
+    print(f"shelve: keep {cfg['keep']} agent tabs awake{'  (DRY RUN)' if cfg['dry_run'] else ''}\n")
+    n = 0
+    for t in order:
+        label = snap.tabs[t].get("label") or ""
+        if t in shelved_tabs:
+            recs = [r for r in state["shelf"].values() if r.get("tab_id") == t]
+            print(f"  {cfg['shelf_marker']} {t:<8} {label[:40]:<40} shelved  {', '.join(r['kind'] for r in recs)}")
+            continue
+        status, _ = tab_verdict(snap, t, cfg)
+        if status == "none":
+            continue
+        if status != "pinned":
+            n += 1
+        mark = "📌" if status == "pinned" else f"{n:>2}"
+        note = "" if status in ("ready", "pinned") else status.removeprefix("busy:")
+        if t == focused:
+            note = f"focused {note}".strip()
+        print(f"  {mark} {t:<8} {label[:40]:<40} {'pinned' if status == 'pinned' else 'awake':<8} {note}")
+    for o in state["orphans"]:
+        print(f"\n  orphan ({o['orphaned']}): {o['manual']}")
+    if wait:
+        input("\npress Enter to close")
+
+
+def main(argv: list[str]) -> None:
+    cmd = argv[1] if len(argv) > 1 else "status"
+    if cmd == "hook":
+        cmd_hook(argv[2] if len(argv) > 2 else "kick")
+    elif cmd == "work":
+        work()
+    elif cmd == "status":
+        cmd_status("--wait" in argv)
+    elif cmd == "pin":
+        cmd_pin()
+    elif cmd == "shelve-tab":
+        tab = argv[2] if len(argv) > 2 else context_tab()
+        enqueue(f"shelve {tab}")
+        spawn_worker()
+    elif cmd == "unshelve-all":
+        enqueue("unshelve-all")
+        spawn_worker()
+    elif cmd == "log":
+        print(LOG.read_text() if LOG.exists() else "(empty)")
+    else:
+        sys.exit(f"usage: herdr-shelve [status|hook EVENT|work|pin|shelve-tab [TAB]|unshelve-all|log]")
+
+
+if __name__ == "__main__":
+    main(sys.argv)

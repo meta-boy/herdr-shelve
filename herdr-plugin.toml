@@ -1,0 +1,53 @@
+id = "meta-boy.shelve"
+name = "shelve"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Keep only the N most recently used agent tabs awake; shelve the rest (quit the agent, keep the tab) and bring them back on focus. Works for any agent herdr tracks a session for."
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["./herdr-shelve", "hook", "startup"]
+
+[[events]]
+on = "tab.focused"
+command = ["./herdr-shelve", "hook", "tab.focused"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./herdr-shelve", "hook", "pane.agent_status_changed"]
+
+[[events]]
+on = "tab.closed"
+command = ["./herdr-shelve", "hook", "tab.closed"]
+
+[[actions]]
+id = "pin"
+title = "shelve: pin/unpin this tab"
+contexts = ["tab", "pane"]
+command = ["./herdr-shelve", "pin"]
+
+[[actions]]
+id = "shelve"
+title = "shelve: shelve this tab now"
+contexts = ["tab", "pane"]
+command = ["./herdr-shelve", "shelve-tab"]
+
+[[actions]]
+id = "unshelve-all"
+title = "shelve: bring every shelved tab back"
+contexts = []
+command = ["./herdr-shelve", "unshelve-all"]
+
+[[actions]]
+id = "rebalance"
+title = "shelve: rebalance now"
+contexts = []
+command = ["./herdr-shelve", "hook", "kick"]
+
+[[panes]]
+id = "status"
+title = "shelve"
+placement = "popup"
+width = 110
+height = 30
+command = ["./herdr-shelve", "status", "--wait"]
